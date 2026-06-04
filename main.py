@@ -274,9 +274,12 @@ class WarningTracker:
         if len(self.warnings) >= self.limit and not self.alert_sent_for_current_batch:
             if self.notifier:
                 warnings_data = [{'type': w[1]} for w in self.warnings]
-                self.notifier.send_driver_alert(len(self.warnings), warnings_data)
-                self.alert_sent_for_current_batch = True
-                print(f"[ALERT] ⚠️ {len(self.warnings)} закрытий глаз! Уведомление отправлено")
+                sent = self.notifier.send_driver_alert(len(self.warnings), warnings_data)
+                if sent:  # ← проверяем, что действительно отправили
+                    self.alert_sent_for_current_batch = True
+                    print(f"[ALERT] ⚠️ {len(self.warnings)} закрытий глаз! Уведомление отправлено")
+                else:
+                    print(f"[ALERT] ⚠️ {len(self.warnings)} закрытий глаз! Нет подписчиков для отправки")
                 
         return len(self.warnings)
     
