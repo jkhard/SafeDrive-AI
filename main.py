@@ -1,10 +1,3 @@
-"""
-AI Driver Monitor — MediaPipe demo (Russian MP3 alerts)
-- Анализ закрытия глаз (>2.5s) -> звуковое предупреждение (рус.)
-- Анализ отвода взгляда в сторону (>3s) -> звуковое предупреждение (рус.)
-- Анализ зевка (рот широко открыт >3s) -> звуковое предупреждение (рус.)
-"""
-
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -13,27 +6,43 @@ import os
 import csv
 import pygame
 import threading
+import requests
+import json
+from datetime import datetime
+from collections import deque
 
-# ---------- Настройки ----------
-EAR_CLOSED_THRESHOLD = 0.15   # порог EAR для "закрытых" глаз
-EYE_CLOSED_SECONDS = 2.5      # секунды подряд > порога -> предупреждение
+# тг бот
+TELEGRAM_BOT_TOKEN = "8930435350:AAFwLipzUGsTMrvMokXELaVajRSjHNI_mU4"
+CONFIG_FILE = "telegram_users.json"
 
-GAZE_LEFT_THRESHOLD = -0.15   # порог для взгляда влево (нормализованное смещение)
-GAZE_RIGHT_THRESHOLD = 0.15   # порог для взгляда вправо (нормализованное смещение)
-GAZE_AWAY_SECONDS = 3.0       # секунды подряд -> предупреждение
+# уведы
+WARNING_LIMIT = 3
+WARNING_TIME_WINDOW = 300
+TELEGRAM_COOLDOWN = 600
 
-MOUTH_OPEN_THRESHOLD = 0.4   # порог открытия рта для зевка
-MOUTH_OPEN_SECONDS = 1.5      # секунды подряд -> предупреждение
+# настройка мониторинга
+EAR_CLOSED_THRESHOLD = 0.10
+EYE_CLOSED_SECONDS = 2.5
+
+GAZE_LEFT_THRESHOLD = -0.15
+GAZE_RIGHT_THRESHOLD = 0.15
+GAZE_AWAY_SECONDS = 3.0
+
+MOUTH_OPEN_THRESHOLD = 0.4
+MOUTH_OPEN_SECONDS = 1.5
+
+HEAD_TURN_SECONDS = 3.0
+HEAD_TURN_THRESHOLD = 0.25
 
 LOG_DIR = 'logs'
 LOG_FILE = os.path.join(LOG_DIR, 'events.csv')
+WARNING_LOG_FILE = os.path.join(LOG_DIR, 'warnings.csv')
 
-# Пути к звуковым файлам
 SOUND_EYES_CLOSED = "Закрыл_глаза.mp3"
 SOUND_GAZE_AWAY = "Внимание_на_дорогу.mp3"
 SOUND_YAWNING = "Перерыв.mp3"
+SOUND_HEAD_TURN = "Поворот_головы.mp3"
 
-# Индексы MediaPipe
 LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
 LEFT_IRIS_IDX = [468, 469, 470, 471]
@@ -41,224 +50,398 @@ RIGHT_IRIS_IDX = [473, 474, 475, 476]
 MOUTH_TOP = 13
 MOUTH_BOTTOM = 14
 
-# ---------- Инициализация pygame для воспроизведения звуков ----------
 pygame.mixer.init()
 
-# ---------- Вспомогательные функции ----------
+# ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==========
+class UserManager:
+    def __init__(self, config_file=CONFIG_FILE):
+        self.config_file = config_file
+        self.users = {}
+        self.load_users()
+        
+    def load_users(self):
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.users = {str(k): v for k, v in data.get('users', {}).items()}
+                    print(f"\n[USERS] Загружено {len(self.users)} пользователей")
+            except Exception as e:
+                print(f"[USERS] Ошибка загрузки: {e}")
+                self.users = {}
+        else:
+            print("[USERS] Нет сохранённых пользователей")
+    
+    def save_users(self):
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'users': self.users,
+                    'last_updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"[USERS] Ошибка сохранения: {e}")
+            return False
+    
+    def add_user(self, chat_id, first_name="", username="", last_name=""):
+        chat_id_str = str(chat_id)
+        if chat_id_str in self.users:
+            return False
+        
+        name = f"{first_name} {last_name}".strip()
+        if not name:
+            name = username if username else f"User_{chat_id_str[-4:]}"
+        
+        self.users[chat_id_str] = {
+            'chat_id': chat_id_str,
+            'name': name,
+            'username': username,
+            'first_name': first_name,
+            'last_name': last_name,
+            'added_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'last_active': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.save_users()
+        print(f"[USERS] Новый пользователь: {name}")
+        return True
+    
+    def get_all_users(self):
+        return list(self.users.keys())
+    
+    def get_users_count(self):
+        return len(self.users)
+
+# ========== TELEGRAM НОТИФИКАТОР ==========
+class TelegramNotifier:
+    def __init__(self, bot_token):
+        self.bot_token = bot_token
+        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+        self.user_manager = UserManager()
+        self.last_notification_time = 0
+        self.last_update_id = None
+        self.bot_username = None
+        
+        self._get_bot_username()
+        self.start_listener()
+        
+        if self.user_manager.get_users_count() > 0:
+            print(f"[TELEGRAM] Бот готов. {self.user_manager.get_users_count()} подписчиков\n")
+    
+    def _get_bot_username(self):
+        try:
+            response = requests.get(f"{self.base_url}/getMe", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ok'):
+                    self.bot_username = data['result'].get('username', 'SafeCarAi_bot')
+                    print(f"[TELEGRAM] Бот: @{self.bot_username}")
+                    return
+        except:
+            pass
+        self.bot_username = "SafeCarAi_bot"
+    
+    def start_listener(self):
+        thread = threading.Thread(target=self._listen_for_users, daemon=True)
+        thread.start()
+    
+    def _listen_for_users(self):
+        while True:
+            try:
+                url = f"{self.base_url}/getUpdates"
+                params = {'timeout': 10, 'allowed_updates': ['message']}
+                if self.last_update_id:
+                    params['offset'] = self.last_update_id + 1
+                
+                response = requests.get(url, params=params, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('ok') and data['result']:
+                        for update in data['result']:
+                            if 'message' in update:
+                                message = update['message']
+                                chat = message.get('chat', {})
+                                chat_id = chat.get('id')
+                                user = message.get('from', {})
+                                
+                                if chat_id:
+                                    first_name = user.get('first_name', '')
+                                    last_name = user.get('last_name', '')
+                                    username = user.get('username', '')
+                                    
+                                    if self.user_manager.add_user(chat_id, first_name, username, last_name):
+                                        self._send_welcome_message(chat_id)
+                            
+                            if 'update_id' in update:
+                                self.last_update_id = update['update_id']
+            except:
+                pass
+            time.sleep(2)
+    
+    def _send_welcome_message(self, chat_id):
+        message = (
+            "<b>Добро пожаловать в SafeDrive AI Monitor!</b>\n\n"
+            "Вы подписались на уведомления о состоянии водителя.\n\n"
+            "<b>Что отслеживается:</b>\n"
+            "• Закрытие глаз более 2.5 секунд → уведомление при 3+ раз за 5 мин\n"
+            "• Отведение взгляда более 3 сек\n"
+            "• Поворот головы более 3 сек\n"
+            "• Сильная зевота 1.5 сек\n\n"
+            "Берегите себя!"
+        )
+        self._send_message_async(chat_id, message)
+    
+    def _send_message_async(self, chat_id, message):
+        def send():
+            try:
+                url = f"{self.base_url}/sendMessage"
+                payload = {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "HTML"
+                }
+                requests.post(url, json=payload, timeout=10)
+            except:
+                pass
+        threading.Thread(target=send, daemon=True).start()
+    
+    def send_to_all(self, message):
+        users = self.user_manager.get_all_users()
+        if not users:
+            return False
+        
+        current_time = time.time()
+        if current_time - self.last_notification_time < TELEGRAM_COOLDOWN:
+            remaining = int(TELEGRAM_COOLDOWN - (current_time - self.last_notification_time))
+            print(f"[TELEGRAM] Кулдаун: {remaining} сек")
+            return False
+        
+        print(f"[TELEGRAM] 📤 Отправка {len(users)} пользователям...")
+        for chat_id in users:
+            self._send_message_async(chat_id, message)
+            time.sleep(0.1)
+        
+        self.last_notification_time = current_time
+        print(f"[TELEGRAM] ✅ Уведомление отправлено")
+        return True
+    
+    def send_driver_alert(self, warning_count, warnings_list):
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        eyes_closed_count = sum(1 for w in warnings_list if w.get('type') == 'eyes_closed')
+        
+        message = f"🚨 <b>ВНИМАНИЕ! ВОДИТЕЛЬ ЗАСЫПАЕТ!</b> 🚨\n\n"
+        message += f"<b>Водитель</b> закрыл глаза <b>{eyes_closed_count}</b> раз(а) за последние {WARNING_TIME_WINDOW//60} минут!\n\n"
+        message += f"<b>⚠️ Возможная усталость или засыпание за рулём!</b>\n\n"
+        message += f"<b>Время:</b> {current_time_str}\n\n"
+        message += f"<i>Пожалуйста, проверьте состояние водителя!</i>"
+        
+        return self.send_to_all(message)
+    
+    def get_status(self):
+        count = self.user_manager.get_users_count()
+        if count > 0:
+            return f"OK ({count} subs)"
+        else:
+            return f"Waiting (@{self.bot_username})"
+
+# ========== ТРЕКЕР ПРЕДУПРЕЖДЕНИЙ ==========
+class WarningTracker:
+    def __init__(self, limit=3, time_window=300):
+        self.limit = limit
+        self.time_window = time_window
+        self.warnings = deque()
+        self.notifier = None
+        self.alert_sent_for_current_batch = False
+        
+    def set_notifier(self, notifier):
+        self.notifier = notifier
+        
+    def add_warning(self, warning_type):
+        if warning_type != 'eyes_closed':
+            return len(self.warnings)
+        
+        current_time = time.time()
+        
+        if not self.warnings or current_time - self.warnings[0][0] > self.time_window:
+            self.alert_sent_for_current_batch = False
+        
+        self.warnings.append((current_time, warning_type))
+        
+        while self.warnings and current_time - self.warnings[0][0] > self.time_window:
+            self.warnings.popleft()
+        
+        if len(self.warnings) >= self.limit and not self.alert_sent_for_current_batch:
+            if self.notifier:
+                warnings_data = [{'type': w[1]} for w in self.warnings]
+                self.notifier.send_driver_alert(len(self.warnings), warnings_data)
+                self.alert_sent_for_current_batch = True
+                print(f"[ALERT] ⚠️ {len(self.warnings)} закрытий глаз! Уведомление отправлено")
+                
+        return len(self.warnings)
+    
+    def get_stats(self):
+        return {
+            'count': len(self.warnings),
+            'limit': self.limit,
+            'window_minutes': self.time_window // 60
+        }
+
+# ========== MP3 ПЛЕЕР ==========
+class MP3Player:
+    def __init__(self, cooldown=4.0):
+        self.cooldown = cooldown
+        self.last_warning_time = {}
+        self.warning_tracker = None
+        
+    def set_warning_tracker(self, tracker):
+        self.warning_tracker = tracker
+        
+    def play_sound(self, sound_file, warning_type=""):
+        now = time.time()
+        
+        if warning_type in self.last_warning_time:
+            if now - self.last_warning_time[warning_type] < self.cooldown:
+                return
+        
+        if not os.path.exists(sound_file):
+            print(f'[SOUND ERROR] {sound_file} не найден')
+            return
+        
+        if self.warning_tracker and warning_type:
+            total = self.warning_tracker.add_warning(warning_type)
+            stats = self.warning_tracker.get_stats()
+        
+        def play():
+            try:
+                pygame.mixer.music.load(sound_file)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.1)
+            except Exception as e:
+                print(f'Ошибка воспроизведения: {e}')
+        
+        threading.Thread(target=play, daemon=True).start()
+        
+        if warning_type:
+            self.last_warning_time[warning_type] = now
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def ensure_logfile():
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['timestamp', 'ear', 'perclos', 'gaze_left', 'gaze_right', 'mouth_open'])
+            writer.writerow(['timestamp', 'ear', 'perclos', 'gaze_left', 'gaze_right', 'mouth_open', 'head_turned'])
 
-def log_event(ear, perclos, gaze_left, gaze_right, mouth_open):
+def log_event(ear, perclos, gaze_left, gaze_right, mouth_open, head_turned):
     ensure_logfile()
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow([time.time(), f'{ear:.4f}', f'{perclos:.4f}', int(gaze_left), int(gaze_right), f'{mouth_open:.4f}'])
+        writer.writerow([time.time(), f'{ear:.4f}', f'{perclos:.4f}', 
+                        int(gaze_left), int(gaze_right), f'{mouth_open:.4f}', int(head_turned)])
 
-# ---------- MP3 Player ----------
-class MP3Player:
-    def __init__(self, cooldown=4.0):
-        self.cooldown = cooldown
-        self.last_warning_time = {}
-        
-    def play_sound(self, sound_file, warning_type=""):
-        now = time.time()
-        
-        # Проверка кулдауна для конкретного типа предупреждения
-        if warning_type in self.last_warning_time:
-            if now - self.last_warning_time[warning_type] < self.cooldown:
-                return
-        
-        # Проверяем существование файла
-        if not os.path.exists(sound_file):
-            print(f'[SOUND ERROR] Файл не найден: {sound_file}')
-            return
-            
-        print(f'[SOUND] Воспроизведение: {sound_file}')
-        
-        def play_mp3():
-            try:
-                pygame.mixer.music.load(sound_file)
-                pygame.mixer.music.play()
-                # Ждем окончания воспроизведения
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.1)
-            except Exception as e:
-                print(f'Ошибка воспроизведения звука: {e}')
-        
-        thread = threading.Thread(target=play_mp3)
-        thread.daemon = True
-        thread.start()
-        
-        # Обновляем время последнего предупреждения этого типа
-        if warning_type:
-            self.last_warning_time[warning_type] = now
-
-# ---------- Geometric helpers ----------
 def eye_aspect_ratio(eye_points):
     if len(eye_points) < 6:
         return 0.0
-    
     points = np.array(eye_points)
-    
-    # Вычисляем вертикальные расстояния
     vert1 = np.linalg.norm(points[1] - points[5])
     vert2 = np.linalg.norm(points[2] - points[4])
-    
-    # Вычисляем горизонтальное расстояние
     horiz = np.linalg.norm(points[0] - points[3])
-    
     if horiz == 0:
         return 0.0
-        
     return (vert1 + vert2) / (2.0 * horiz)
 
 def get_landmark_point(landmarks, index):
-    """Безопасное получение точки по индексу"""
     if index < len(landmarks):
         return landmarks[index]
     return None
 
-# ---------- Улучшенная функция для анализа направления взгляда ----------
 def analyze_gaze_direction(landmarks):
-    """Анализирует направление взгляда на основе положения зрачков относительно углов глаз"""
     try:
-        # Получаем центры зрачков
         left_iris_center = np.mean([landmarks[i] for i in LEFT_IRIS_IDX if i < len(landmarks)], axis=0)
         right_iris_center = np.mean([landmarks[i] for i in RIGHT_IRIS_IDX if i < len(landmarks)], axis=0)
         
-        # Получаем углы глаз (внешний и внутренний угол для каждого глаза)
-        left_eye_inner = landmarks[LEFT_EYE_IDX[0]]  # Внутренний угол левого глаза
-        left_eye_outer = landmarks[LEFT_EYE_IDX[3]]  # Внешний угол левого глаза
-        right_eye_inner = landmarks[RIGHT_EYE_IDX[0]]  # Внутренний угол правого глаза
-        right_eye_outer = landmarks[RIGHT_EYE_IDX[3]]  # Внешний угол правого глаза
+        left_eye_inner = landmarks[LEFT_EYE_IDX[0]]
+        left_eye_outer = landmarks[LEFT_EYE_IDX[3]]
+        right_eye_inner = landmarks[RIGHT_EYE_IDX[0]]
+        right_eye_outer = landmarks[RIGHT_EYE_IDX[3]]
         
-        # Вычисляем относительное положение зрачков в пределах глаз
-        # Для левого глаза: 0.0 = у внутреннего угла, 1.0 = у внешнего угла
         left_eye_width = left_eye_outer[0] - left_eye_inner[0]
-        if left_eye_width != 0:
-            left_gaze_ratio = (left_iris_center[0] - left_eye_inner[0]) / left_eye_width
-        else:
-            left_gaze_ratio = 0.5
+        left_gaze_ratio = (left_iris_center[0] - left_eye_inner[0]) / left_eye_width if left_eye_width != 0 else 0.5
             
-        # Для правого глаза: 0.0 = у внутреннего угла, 1.0 = у внешнего угла
         right_eye_width = right_eye_outer[0] - right_eye_inner[0]
-        if right_eye_width != 0:
-            right_gaze_ratio = (right_iris_center[0] - right_eye_inner[0]) / right_eye_width
-        else:
-            right_gaze_ratio = 0.5
+        right_gaze_ratio = (right_iris_center[0] - right_eye_inner[0]) / right_eye_width if right_eye_width != 0 else 0.5
         
-        # Нормализуем соотношения (в идеале при прямом взгляде оба значения около 0.5)
-        # Преобразуем в диапазон [-0.5, 0.5], где 0 = прямой взгляд
-        left_gaze_normalized = left_gaze_ratio - 0.5
-        right_gaze_normalized = right_gaze_ratio - 0.5
+        avg_gaze_normalized = ((left_gaze_ratio - 0.5) + (right_gaze_ratio - 0.5)) / 2
         
-        # Среднее значение для обоих глаз
-        avg_gaze_normalized = (left_gaze_normalized + right_gaze_normalized) / 2
-        
-        # Определяем направление взгляда
         gaze_left = avg_gaze_normalized < GAZE_LEFT_THRESHOLD
         gaze_right = avg_gaze_normalized > GAZE_RIGHT_THRESHOLD
-        gaze_away = gaze_left or gaze_right
+        gaze_direction = "CENTER"
+        if gaze_left:
+            gaze_direction = "LEFT"
+        elif gaze_right:
+            gaze_direction = "RIGHT"
         
-        return gaze_away, gaze_left, gaze_right, avg_gaze_normalized, left_gaze_ratio, right_gaze_ratio
-        
-    except Exception as e:
-        print(f"Gaze analysis error: {e}")
-        return False, False, False, 0, 0.5, 0.5
+        return (gaze_left or gaze_right), gaze_left, gaze_right, avg_gaze_normalized, gaze_direction
+    except:
+        return False, False, False, 0, "CENTER"
 
-# ---------- Функция для анализа поворота головы ----------
-def analyze_head_turn(landmarks, frame_width):
-    """Анализирует поворот головы влево/вправо"""
+def analyze_head_direction(landmarks, frame_width):
     try:
-        # Используем ключевые точки лица для определения поворота
-        face_left = 234   # Левая сторона лица
-        face_right = 454  # Правая сторона лица
-        nose_tip = 1      # Кончик носа
+        left_side = get_landmark_point(landmarks, 234)
+        right_side = get_landmark_point(landmarks, 454)
+        nose = get_landmark_point(landmarks, 1)
         
-        left_side = get_landmark_point(landmarks, face_left)
-        right_side = get_landmark_point(landmarks, face_right)
-        nose_point = get_landmark_point(landmarks, nose_tip)
+        if not all([left_side, right_side, nose]):
+            return False, False, 0.0, "CENTER"
         
-        if not all([left_side, right_side, nose_point]):
-            return False
-        
-        # Вычисляем центр лица
-        face_center_x = (left_side[0] + right_side[0]) / 2
-        
-        # Вычисляем смещение носа относительно центра лица
-        nose_offset = nose_point[0] - face_center_x
-        
-        # Нормализуем относительно ширины лица
+        face_center = (left_side[0] + right_side[0]) / 2
         face_width = abs(right_side[0] - left_side[0])
+        
         if face_width == 0:
-            return False
+            return False, False, 0.0, "CENTER"
             
-        head_turn_ratio = abs(nose_offset) / face_width
+        turn_ratio = (nose[0] - face_center) / face_width
+        head_direction = "CENTER"
+        if turn_ratio < -HEAD_TURN_THRESHOLD:
+            head_direction = "LEFT"
+        elif turn_ratio > HEAD_TURN_THRESHOLD:
+            head_direction = "RIGHT"
         
-        # Определяем поворот головы (более строгий порог)
-        return head_turn_ratio > 0.25
-        
-    except Exception as e:
-        print(f"Head turn analysis error: {e}")
-        return False
+        return turn_ratio < -HEAD_TURN_THRESHOLD, turn_ratio > HEAD_TURN_THRESHOLD, turn_ratio, head_direction
+    except:
+        return False, False, 0.0, "CENTER"
 
-# ---------- Функция для определения прямого положения головы ----------
-def analyze_head_straight(landmarks, frame_width):
-    """Анализирует, держится ли голова прямо"""
+def analyze_mouth_open(landmarks):
     try:
-        face_left = 234   # Левая сторона лица
-        face_right = 454  # Правая сторона лица
-        nose_tip = 1      # Кончик носа
-        forehead = 10     # Лоб
-        chin = 152        # Подбородок
+        top = get_landmark_point(landmarks, MOUTH_TOP)
+        bottom = get_landmark_point(landmarks, MOUTH_BOTTOM)
+        left_eye_ref = get_landmark_point(landmarks, 33)
+        right_eye_ref = get_landmark_point(landmarks, 263)
         
-        left_side = get_landmark_point(landmarks, face_left)
-        right_side = get_landmark_point(landmarks, face_right)
-        nose_point = get_landmark_point(landmarks, nose_tip)
-        forehead_point = get_landmark_point(landmarks, forehead)
-        chin_point = get_landmark_point(landmarks, chin)
-        
-        if not all([left_side, right_side, nose_point, forehead_point, chin_point]):
-            return False
-        
-        # Вычисляем центр лица по горизонтали
-        face_center_x = (left_side[0] + right_side[0]) / 2
-        
-        # Вычисляем смещение носа относительно центра лица
-        nose_offset = abs(nose_point[0] - face_center_x)
-        
-        # Нормализуем относительно ширины лица
-        face_width = abs(right_side[0] - left_side[0])
-        if face_width == 0:
-            return False
-            
-        head_turn_ratio = nose_offset / face_width
-        
-        # Проверяем вертикальное выравнивание (лоб-нос-подбородок)
-        vertical_alignment = abs((forehead_point[0] + chin_point[0]) / 2 - nose_point[0])
-        vertical_ratio = vertical_alignment / face_width
-        
-        # Голова считается прямой, если:
-        # 1. Поворот головы минимальный (меньше 0.1)
-        # 2. Вертикальное выравнивание хорошее (меньше 0.05)
-        head_straight = (head_turn_ratio < 0.1) and (vertical_ratio < 0.05)
-        
-        return head_straight
-        
-    except Exception as e:
-        print(f"Head straight analysis error: {e}")
-        return False
+        if top and bottom and left_eye_ref and right_eye_ref:
+            mouth_height = np.linalg.norm(np.array(bottom) - np.array(top))
+            eye_distance = np.linalg.norm(np.array(right_eye_ref) - np.array(left_eye_ref))
+            if eye_distance > 0:
+                return mouth_height / eye_distance
+    except:
+        pass
+    return 0.0
 
-# ---------- Main loop ----------
+# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
-    ensure_logfile()
-    mp3_player = MP3Player(cooldown=5.0)
-
+    print("\n!!!! SafeDrive AI Driver Monitor !!!!\n")
+    
+    notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN)
+    
+    warning_tracker = WarningTracker(limit=WARNING_LIMIT, time_window=WARNING_TIME_WINDOW)
+    warning_tracker.set_notifier(notifier)
+    
+    mp3_player = MP3Player(cooldown=4.0)
+    mp3_player.set_warning_tracker(warning_tracker)
+    
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
@@ -267,24 +450,26 @@ def main():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     )
-
+    
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print('ERROR: cannot open camera')
         return
-
-    # Таймеры для отслеживания продолжительности состояний
+    
+    # Таймеры для отслеживания длительности состояний
     eye_closed_start = None
     gaze_left_start = None
     gaze_right_start = None
-    gaze_straight_head_start = None  # Таймер для взгляда в сторону при прямой голове
     mouth_open_start = None
+    head_turn_start = None
+    head_turn_direction = None
     
-    # Буфер для PERCLOS (процент закрытых глаз)
     ear_buffer = []
-    perclos_window = 5.0  # 5 секунд для расчета PERCLOS
+    perclos_window = 5.0
     
-    print('Запуск AI Driver Monitor (нажмите ESC для выхода)')
+    print(f"\nЛимит закрытий глаз: {WARNING_LIMIT} за {WARNING_TIME_WINDOW//60} минут")
+    print(f"Подписчики: {notifier.user_manager.get_users_count()}\n")
+    print("Подписка: напишите @" + (notifier.bot_username or "SafeCarAi_bot") + " в Telegram\n\n")
     
     while True:
         ret, frame = cap.read()
@@ -296,199 +481,217 @@ def main():
         results = face_mesh.process(rgb_frame)
         
         current_time = time.time()
-        face_detected = False
         
-        if results.multi_face_landmarks:
-            face_detected = True
+        frame_h, frame_w = frame.shape[:2]
+        
+        ear = 0.0
+        perclos = 0.0
+        gaze_direction = "CENTER"
+        gaze_away = False
+        head_direction = "CENTER"
+        mouth_ratio = 0.0
+        face_detected = results.multi_face_landmarks is not None and len(results.multi_face_landmarks) > 0
+        
+        if face_detected:
             face_landmarks = results.multi_face_landmarks[0]
+            landmarks = [(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks.landmark]
             
-            # Конвертируем landmarks в пиксельные координаты
-            landmarks = []
-            for landmark in face_landmarks.landmark:
-                x = int(landmark.x * w)
-                y = int(landmark.y * h)
-                landmarks.append((x, y))
-            
-            # Отрисовка сетки лица
             mp.solutions.drawing_utils.draw_landmarks(
                 frame, face_landmarks, mp_face_mesh.FACEMESH_TESSELATION,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=mp.solutions.drawing_styles.get_default_face_mesh_tesselation_style()
             )
             
-            # 1. АНАЛИЗ ЗАКРЫТИЯ ГЛАЗ
-            ear = 0.0
             try:
                 left_eye = [landmarks[i] for i in LEFT_EYE_IDX if i < len(landmarks)]
                 right_eye = [landmarks[i] for i in RIGHT_EYE_IDX if i < len(landmarks)]
-                
                 if len(left_eye) >= 6 and len(right_eye) >= 6:
-                    left_ear = eye_aspect_ratio(left_eye)
-                    right_ear = eye_aspect_ratio(right_eye)
-                    ear = (left_ear + right_ear) / 2.0
-            except Exception as e:
-                print(f"EAR calculation error: {e}")
+                    ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
+            except:
                 ear = 0.0
             
-            # Обновляем буфер для PERCLOS
             ear_buffer.append((current_time, ear))
-            # Удаляем старые записи
             ear_buffer = [(t, e) for t, e in ear_buffer if current_time - t <= perclos_window]
+            perclos = sum(1 for _, e in ear_buffer if e < EAR_CLOSED_THRESHOLD) / len(ear_buffer) if ear_buffer else 0.0
             
-            # Вычисляем PERCLOS
-            if ear_buffer:
-                closed_frames = sum(1 for t, e in ear_buffer if e < EAR_CLOSED_THRESHOLD)
-                perclos = closed_frames / len(ear_buffer)
-            else:
-                perclos = 0.0
-            
-            # Проверка длительного закрытия глаз
-            if ear < EAR_CLOSED_THRESHOLD:
+            # закрытие глаз
+            eyes_closed = ear < EAR_CLOSED_THRESHOLD
+            if eyes_closed:
                 if eye_closed_start is None:
                     eye_closed_start = current_time
-                else:
-                    closed_duration = current_time - eye_closed_start
-                    if closed_duration >= EYE_CLOSED_SECONDS:
-                        mp3_player.play_sound(SOUND_EYES_CLOSED, "eyes_closed")
-                        eye_closed_start = current_time  # Сброс таймера
+                elif current_time - eye_closed_start >= EYE_CLOSED_SECONDS:
+                    mp3_player.play_sound(SOUND_EYES_CLOSED, "eyes_closed")
+                    eye_closed_start = current_time
             else:
                 eye_closed_start = None
+            eyes_closed_duration = current_time - eye_closed_start if eye_closed_start else 0
             
-            # 2. АНАЛИЗ ОТВОДА ВЗГЛЯДА В СТОРОНЫ
-            gaze_away, gaze_left, gaze_right, gaze_offset, left_gaze_ratio, right_gaze_ratio = analyze_gaze_direction(landmarks)
-            head_turn = analyze_head_turn(landmarks, w)
-            head_straight = analyze_head_straight(landmarks, w)
+            # анализ взгляда
+            gaze_away, gaze_left, gaze_right, gaze_offset, gaze_direction = analyze_gaze_direction(landmarks)
             
-            # Обработка взгляда влево (при любом положении головы)
             if gaze_left:
                 if gaze_left_start is None:
                     gaze_left_start = current_time
-                else:
-                    gaze_duration = current_time - gaze_left_start
-                    if gaze_duration >= GAZE_AWAY_SECONDS:
-                        mp3_player.play_sound(SOUND_GAZE_AWAY, "gaze_left")
-                        gaze_left_start = current_time  # Сброс таймера
+                elif current_time - gaze_left_start >= GAZE_AWAY_SECONDS:
+                    mp3_player.play_sound(SOUND_GAZE_AWAY, "gaze_left")
+                    gaze_left_start = current_time
             else:
                 gaze_left_start = None
             
-            # Обработка взгляда вправо (при любом положении головы)
             if gaze_right:
                 if gaze_right_start is None:
                     gaze_right_start = current_time
-                else:
-                    gaze_duration = current_time - gaze_right_start
-                    if gaze_duration >= GAZE_AWAY_SECONDS:
-                        mp3_player.play_sound(SOUND_GAZE_AWAY, "gaze_right")
-                        gaze_right_start = current_time  # Сброс таймера
+                elif current_time - gaze_right_start >= GAZE_AWAY_SECONDS:
+                    mp3_player.play_sound(SOUND_GAZE_AWAY, "gaze_right")
+                    gaze_right_start = current_time
             else:
                 gaze_right_start = None
             
-            # ОСОБАЯ СИТУАЦИЯ: голова прямая, но взгляд отведен в сторону
-            if head_straight and gaze_away:
-                if gaze_straight_head_start is None:
-                    gaze_straight_head_start = current_time
-                else:
-                    gaze_duration = current_time - gaze_straight_head_start
-                    if gaze_duration >= GAZE_AWAY_SECONDS:
-                        # Особое предупреждение для этой ситуации
-                        mp3_player.play_sound(SOUND_GAZE_AWAY, "gaze_straight_head")
-                        gaze_straight_head_start = current_time  # Сброс таймера
+            gaze_duration = 0
+            if gaze_left_start:
+                gaze_duration = current_time - gaze_left_start
+            elif gaze_right_start:
+                gaze_duration = current_time - gaze_right_start
+            
+            # анализ поворота головы
+            head_left, head_right, head_ratio, head_direction = analyze_head_direction(landmarks, w)
+            
+            if head_left or head_right:
+                current_dir = 'left' if head_left else 'right'
+                if head_turn_start is None:
+                    head_turn_start = current_time
+                    head_turn_direction = current_dir
+                elif head_turn_direction == current_dir and current_time - head_turn_start >= HEAD_TURN_SECONDS:
+                    mp3_player.play_sound(SOUND_HEAD_TURN, f"head_turn_{current_dir}")
+                    head_turn_start = current_time
             else:
-                gaze_straight_head_start = None
+                head_turn_start = None
             
-            # 3. АНАЛИЗ ЗЕВКА (ОТКРЫТИЯ РТА)
-            mouth_open_ratio = 0.0
-            try:
-                top = get_landmark_point(landmarks, MOUTH_TOP)
-                bottom = get_landmark_point(landmarks, MOUTH_BOTTOM)
-                
-                if top and bottom:
-                    mouth_height = np.linalg.norm(np.array(bottom) - np.array(top))
-                    # Нормализуем относительно расстояния между глазами
-                    left_eye_ref = get_landmark_point(landmarks, 33)
-                    right_eye_ref = get_landmark_point(landmarks, 263)
-                    
-                    if left_eye_ref and right_eye_ref:
-                        eye_distance = np.linalg.norm(np.array(right_eye_ref) - np.array(left_eye_ref))
-                        if eye_distance > 0:
-                            mouth_open_ratio = mouth_height / eye_distance
-            except Exception as e:
-                print(f"Mouth detection error: {e}")
+            head_duration = current_time - head_turn_start if head_turn_start else 0
             
-            # Проверка зевка
-            if mouth_open_ratio > MOUTH_OPEN_THRESHOLD:
+            # анализ зевка
+            mouth_ratio = analyze_mouth_open(landmarks)
+            mouth_open = mouth_ratio > MOUTH_OPEN_THRESHOLD
+            
+            if mouth_open:
                 if mouth_open_start is None:
                     mouth_open_start = current_time
-                else:
-                    mouth_duration = current_time - mouth_open_start
-                    if mouth_duration >= MOUTH_OPEN_SECONDS:
-                        mp3_player.play_sound(SOUND_YAWNING, "yawning")
-                        mouth_open_start = current_time
+                elif current_time - mouth_open_start >= MOUTH_OPEN_SECONDS:
+                    mp3_player.play_sound(SOUND_YAWNING, "yawning")
+                    mouth_open_start = current_time
             else:
                 mouth_open_start = None
             
-            # ОТОБРАЖЕНИЕ ИНФОРМАЦИИ НА ЭКРАНЕ
-            y_offset = 30
-            cv2.putText(frame, f"EAR: {ear:.3f}", (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(frame, f"PERCLOS: {perclos:.1%}", (10, y_offset + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(frame, f"Mouth: {mouth_open_ratio:.3f}", (10, y_offset + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(frame, f"Gaze offset: {gaze_offset:.3f}", (10, y_offset + 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255) if gaze_away else (0, 255, 0), 2)
-            cv2.putText(frame, f"Gaze L/R: {left_gaze_ratio:.2f}/{right_gaze_ratio:.2f}", (10, y_offset + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255) if gaze_away else (0, 255, 0), 2)
-            cv2.putText(frame, f"Gaze: {'LEFT' if gaze_left else 'RIGHT' if gaze_right else 'CENTER'}", (10, y_offset + 125), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255) if gaze_away else (0, 255, 0), 2)
-            cv2.putText(frame, f"Head turn: {'YES' if head_turn else 'NO'}", (10, y_offset + 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255) if head_turn else (0, 255, 0), 2)
-            cv2.putText(frame, f"Head straight: {'YES' if head_straight else 'NO'}", (10, y_offset + 175), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if head_straight else (0, 0, 255), 2)
+            mouth_duration = current_time - mouth_open_start if mouth_open_start else 0
             
-            # Отображение предупреждений
-            warning_y = y_offset + 200
-            if eye_closed_start:
-                closed_time = current_time - eye_closed_start
-                cv2.putText(frame, f"Eyes closed: {closed_time:.1f}s", (10, warning_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                warning_y += 25
-            
-            if gaze_left_start:
-                gaze_time = current_time - gaze_left_start
-                cv2.putText(frame, f"Gaze left: {gaze_time:.1f}s", (10, warning_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                warning_y += 25
-            
-            if gaze_right_start:
-                gaze_time = current_time - gaze_right_start
-                cv2.putText(frame, f"Gaze right: {gaze_time:.1f}s", (10, warning_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                warning_y += 25
-            
-            if gaze_straight_head_start:
-                gaze_time = current_time - gaze_straight_head_start
-                cv2.putText(frame, f"Gaze away (straight head): {gaze_time:.1f}s", (10, warning_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)  # Красный цвет для особого предупреждения
-                warning_y += 25
-            
-            if mouth_open_start:
-                mouth_time = current_time - mouth_open_start
-                cv2.putText(frame, f"Yawning: {mouth_time:.1f}s", (10, warning_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            
-            # Логирование каждую секунду
-            if int(current_time) % 1 == 0:  # Раз в секунду
-                log_event(ear, perclos, gaze_left, gaze_right, mouth_open_ratio)
-                
+            if int(current_time) % 5 == 0 and int(current_time) > 0:
+                log_event(ear, perclos, gaze_left, gaze_right, mouth_ratio, head_left or head_right)
+        
+        # инфа на экране
+        stats = warning_tracker.get_stats()
+        tg_status = notifier.get_status()
+        
+
+        # Фон для текста (полупрозрачный)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (5, 5), (420, 280), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        
+        y_offset = 25
+        line_height = 28
+        
+        # Заголовок
+        cv2.putText(frame, "SAFE DRIVE AI MONITOR", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        y_offset += line_height + 5
+        
+        # Статус лица
+        if face_detected:
+            cv2.putText(frame, "Face: DETECTED", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
         else:
-            # Лицо не обнаружено
-            cv2.putText(frame, 'Face not detected', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            gaze_left_start = None
-            gaze_right_start = None
-            gaze_straight_head_start = None
+            cv2.putText(frame, "Face: NOT DETECTED", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
+        y_offset += line_height
         
-        # Отображение кадра
-        cv2.imshow('AI Driver Monitor (ESC - exit)', frame)
+        # Разделитель
+        cv2.line(frame, (10, y_offset - 5), (410, y_offset - 5), (100, 100, 100), 1)
         
-        # Выход по ESC
+        eyes_color = (0, 0, 255) if eyes_closed and face_detected else (0, 255, 0)
+        cv2.putText(frame, "EYES:", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(frame, f"EAR: {ear:.3f} | PERCLOS: {perclos:.0%}", (120, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, eyes_color, 1)
+        y_offset += line_height - 5
+        
+        if eye_closed_start and face_detected:
+            cv2.putText(frame, f"  ⚠ EYES CLOSED: {eyes_closed_duration:.1f}/{EYE_CLOSED_SECONDS}s", (15, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            y_offset += line_height - 5
+        else:
+            y_offset -= 5
+        
+        gaze_color = (0, 0, 255) if gaze_direction != "CENTER" and face_detected else (0, 255, 0)
+        cv2.putText(frame, "GAZE:", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(frame, f"{gaze_direction} | offset: {gaze_offset:.3f}", (120, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, gaze_color, 1)
+        y_offset += line_height - 5
+        
+        if gaze_duration > 0 and face_detected:
+            cv2.putText(frame, f"  ⚠ GAZE AWAY: {gaze_duration:.1f}/{GAZE_AWAY_SECONDS}s", (15, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+            y_offset += line_height - 5
+        else:
+            y_offset -= 5
+        
+        head_color = (0, 0, 255) if head_direction != "CENTER" and face_detected else (0, 255, 0)
+        cv2.putText(frame, "HEAD:", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(frame, f"{head_direction} | ratio: {head_ratio:.2f}", (120, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, head_color, 1)
+        y_offset += line_height - 5
+        
+        if head_duration > 0 and face_detected:
+            cv2.putText(frame, f"  ⚠ HEAD TURN: {head_duration:.1f}/{HEAD_TURN_SECONDS}s", (15, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+            y_offset += line_height - 5
+        else:
+            y_offset -= 5
+        
+        mouth_color = (0, 0, 255) if mouth_open and face_detected else (0, 255, 0)
+        cv2.putText(frame, "MOUTH:", (10, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(frame, f"open ratio: {mouth_ratio:.3f}", (120, y_offset), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, mouth_color, 1)
+        y_offset += line_height - 5
+        
+        if mouth_duration > 0 and face_detected:
+            cv2.putText(frame, f"  ⚠ YAWNING: {mouth_duration:.1f}/{MOUTH_OPEN_SECONDS}s", (15, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+            y_offset += line_height - 5
+        else:
+            y_offset -= 5
+        
+        cv2.line(frame, (10, y_offset - 3), (410, y_offset - 3), (100, 100, 100), 1)
+        
+        # Статистика предупреждений для Telegram
+        warnings_color = (0, 0, 255) if stats['count'] >= stats['limit'] else (255, 255, 0)
+        cv2.putText(frame, f"TELEGRAM WARNINGS: {stats['count']}/{stats['limit']} (last {stats['window_minutes']}min)", 
+                   (10, y_offset + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, warnings_color, 1)
+        y_offset += line_height
+        
+        cv2.putText(frame, f"Telegram: {tg_status}", 
+                   (10, y_offset + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if notifier.user_manager.get_users_count() > 0 else (0, 165, 255), 1)
+        
+        # Отображение
+        cv2.imshow('SafeDrive AI Monitor - Press ESC to exit', frame)
         if cv2.waitKey(1) & 0xFF == 27:
             break
-
+    
     cap.release()
     cv2.destroyAllWindows()
+    print("\n программа завершена")
 
 if __name__ == '__main__':
     main()
