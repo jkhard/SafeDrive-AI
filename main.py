@@ -52,7 +52,7 @@ MOUTH_BOTTOM = 14
 
 pygame.mixer.init()
 
-# ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==========
+# считывание пользователей
 class UserManager:
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
@@ -112,7 +112,7 @@ class UserManager:
     def get_users_count(self):
         return len(self.users)
 
-# ========== TELEGRAM НОТИФИКАТОР ==========
+# настройка бота и пользователей
 class TelegramNotifier:
     def __init__(self, bot_token):
         self.bot_token = bot_token
@@ -217,13 +217,13 @@ class TelegramNotifier:
             print(f"[TELEGRAM] Кулдаун: {remaining} сек")
             return False
         
-        print(f"[TELEGRAM] 📤 Отправка {len(users)} пользователям...")
+        print(f"[TELEGRAM]   Отправка {len(users)} пользователям...")
         for chat_id in users:
             self._send_message_async(chat_id, message)
             time.sleep(0.1)
         
         self.last_notification_time = current_time
-        print(f"[TELEGRAM] ✅ Уведомление отправлено")
+        print(f"[TELEGRAM]   Уведомление отправлено")
         return True
     
     def send_driver_alert(self, warning_count, warnings_list):
@@ -245,7 +245,7 @@ class TelegramNotifier:
         else:
             return f"Waiting (@{self.bot_username})"
 
-# ========== ТРЕКЕР ПРЕДУПРЕЖДЕНИЙ ==========
+# предупреждения
 class WarningTracker:
     def __init__(self, limit=3, time_window=300):
         self.limit = limit
@@ -275,7 +275,7 @@ class WarningTracker:
             if self.notifier:
                 warnings_data = [{'type': w[1]} for w in self.warnings]
                 sent = self.notifier.send_driver_alert(len(self.warnings), warnings_data)
-                if sent:  # ← проверяем, что действительно отправили
+                if sent:
                     self.alert_sent_for_current_batch = True
                     print(f"[ALERT] ⚠️ {len(self.warnings)} закрытий глаз! Уведомление отправлено")
                 else:
@@ -290,7 +290,7 @@ class WarningTracker:
             'window_minutes': self.time_window // 60
         }
 
-# ========== MP3 ПЛЕЕР ==========
+# озвучка
 class MP3Player:
     def __init__(self, cooldown=4.0):
         self.cooldown = cooldown
@@ -329,7 +329,8 @@ class MP3Player:
         if warning_type:
             self.last_warning_time[warning_type] = now
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
+
 def ensure_logfile():
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -433,7 +434,7 @@ def analyze_mouth_open(landmarks):
         pass
     return 0.0
 
-# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
+
 def main():
     print("\n!!!! SafeDrive AI Driver Monitor !!!!\n")
     
@@ -459,7 +460,7 @@ def main():
         print('ERROR: cannot open camera')
         return
     
-    # Таймеры для отслеживания длительности состояний
+    # таймеры для состояний
     eye_closed_start = None
     gaze_left_start = None
     gaze_right_start = None
@@ -595,7 +596,6 @@ def main():
         tg_status = notifier.get_status()
         
 
-        # Фон для текста (полупрозрачный)
         overlay = frame.copy()
         cv2.rectangle(overlay, (5, 5), (420, 280), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
@@ -603,12 +603,11 @@ def main():
         y_offset = 25
         line_height = 28
         
-        # Заголовок
         cv2.putText(frame, "SAFE DRIVE AI MONITOR", (10, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         y_offset += line_height + 5
         
-        # Статус лица
+        # считывание лица
         if face_detected:
             cv2.putText(frame, "Face: DETECTED", (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
@@ -617,7 +616,7 @@ def main():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1)
         y_offset += line_height
         
-        # Разделитель
+
         cv2.line(frame, (10, y_offset - 5), (410, y_offset - 5), (100, 100, 100), 1)
         
         eyes_color = (0, 0, 255) if eyes_closed and face_detected else (0, 255, 0)
@@ -628,7 +627,7 @@ def main():
         y_offset += line_height - 5
         
         if eye_closed_start and face_detected:
-            cv2.putText(frame, f"  ⚠ EYES CLOSED: {eyes_closed_duration:.1f}/{EYE_CLOSED_SECONDS}s", (15, y_offset), 
+            cv2.putText(frame, f"  EYES CLOSED: {eyes_closed_duration:.1f}/{EYE_CLOSED_SECONDS}s", (15, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
             y_offset += line_height - 5
         else:
@@ -642,7 +641,7 @@ def main():
         y_offset += line_height - 5
         
         if gaze_duration > 0 and face_detected:
-            cv2.putText(frame, f"  ⚠ GAZE AWAY: {gaze_duration:.1f}/{GAZE_AWAY_SECONDS}s", (15, y_offset), 
+            cv2.putText(frame, f"  GAZE AWAY: {gaze_duration:.1f}/{GAZE_AWAY_SECONDS}s", (15, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
             y_offset += line_height - 5
         else:
@@ -656,7 +655,7 @@ def main():
         y_offset += line_height - 5
         
         if head_duration > 0 and face_detected:
-            cv2.putText(frame, f"  ⚠ HEAD TURN: {head_duration:.1f}/{HEAD_TURN_SECONDS}s", (15, y_offset), 
+            cv2.putText(frame, f"  HEAD TURN: {head_duration:.1f}/{HEAD_TURN_SECONDS}s", (15, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
             y_offset += line_height - 5
         else:
@@ -670,7 +669,7 @@ def main():
         y_offset += line_height - 5
         
         if mouth_duration > 0 and face_detected:
-            cv2.putText(frame, f"  ⚠ YAWNING: {mouth_duration:.1f}/{MOUTH_OPEN_SECONDS}s", (15, y_offset), 
+            cv2.putText(frame, f"  YAWNING: {mouth_duration:.1f}/{MOUTH_OPEN_SECONDS}s", (15, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
             y_offset += line_height - 5
         else:
@@ -678,7 +677,7 @@ def main():
         
         cv2.line(frame, (10, y_offset - 3), (410, y_offset - 3), (100, 100, 100), 1)
         
-        # Статистика предупреждений для Telegram
+        # статистика предупреждений для тг
         warnings_color = (0, 0, 255) if stats['count'] >= stats['limit'] else (255, 255, 0)
         cv2.putText(frame, f"TELEGRAM WARNINGS: {stats['count']}/{stats['limit']} (last {stats['window_minutes']}min)", 
                    (10, y_offset + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, warnings_color, 1)
